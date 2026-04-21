@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: WP Announcements (Анонсы книг)
- * Description: Анонсы товаров WooCommerce с предзаказом и уведомлениями. Выбор «анонсных» категорий, модалка предзаказа, авто-рассылка при переводе в обычный каталог. Шорткоды [announcements_grid] и [announcements_page].
- * Version: 1.1.0
+ * Plugin Name: WP Announcements
+ * Description: Универсальный плагин анонсов для WooCommerce: любые товары (книги, техника, одежда — что угодно) из выбранных категорий становятся непокупаемыми и получают кнопку «Предзаказ» с модалкой. Автоматическая рассылка подписчикам при переводе в обычный каталог. Шорткоды [announcements_grid] и [announcements_page].
+ * Version: 1.1.1
  * Author: Alexander Nemirov
  * License: GPL-2.0-or-later
  * Text Domain: wp-announcements
@@ -11,7 +11,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('WPAN_VERSION', '1.1.0');
+define('WPAN_VERSION', '1.1.1');
 define('WPAN_FILE', __FILE__);
 define('WPAN_DIR', plugin_dir_path(__FILE__));
 define('WPAN_URL', plugin_dir_url(__FILE__));
@@ -87,18 +87,21 @@ function wpan_default_settings() {
         'categories'        => array(),
         'button_text'       => __('Предзаказ', 'wp-announcements'),
         'modal_title'       => __('Сообщить, когда появится', 'wp-announcements'),
-        'modal_desc'        => __('Оставьте email — мы напишем, как только книга поступит в продажу.', 'wp-announcements'),
+        'modal_desc'        => __('Оставьте email — мы напишем, как только товар появится в продаже.', 'wp-announcements'),
         'success_text'      => __('Спасибо! Мы сообщим вам по email.', 'wp-announcements'),
-        'already_text'      => __('Вы уже подписаны на эту книгу.', 'wp-announcements'),
+        'already_text'      => __('Вы уже подписаны на этот товар.', 'wp-announcements'),
         'admin_email'       => get_option('admin_email'),
         'accent_color'      => '#b7202e',
         'accent_hover'      => '#8f1823',
-        'subject_user'      => __('Книга «{product}» поступила в продажу', 'wp-announcements'),
-        'body_user'         => "Здравствуйте!\n\nКнига «{product}», которую вы ждали, появилась в продаже:\n{product_url}\n\nС уважением,\n{site_name}",
+        'subject_user'      => __('Товар «{product}» поступил в продажу', 'wp-announcements'),
+        'body_user'         => "Здравствуйте!\n\nТовар «{product}», который вы ждали, появился в продаже:\n{product_url}\n\nС уважением,\n{site_name}",
         'subject_admin_new' => __('Новая подписка на анонс: {product}', 'wp-announcements'),
         'subject_admin_rel' => __('Рассылка выполнена: {product} ({count} получателей)', 'wp-announcements'),
         'rate_limit_hour'   => 20, // подписок с одного IP в час
         'uninstall_wipe'    => 0,  // удалять ли таблицу и опции при деинсталляции
+        'show_tags_in_card' => 1,  // показывать метки (например, авторов) в карточке
+        'show_price_in_card'=> 0,  // показывать цену
+        'badge_text'        => __('Анонс', 'wp-announcements'),
     );
 }
 
@@ -545,15 +548,18 @@ function wpan_render_card($post_id) {
     $title   = esc_html(get_the_title($post_id));
     $img     = get_the_post_thumbnail($post_id, 'woocommerce_thumbnail', array('loading' => 'lazy'));
     if (!$img) $img = '<img src="' . esc_url(wc_placeholder_img_src()) . '" alt="">';
-    $authors = wpan_get_authors($post_id);
+    $tags    = wpan_opt('show_tags_in_card', 1) ? wpan_get_authors($post_id) : '';
+    $badge   = esc_html(wpan_opt('badge_text', 'Анонс'));
+    $price   = wpan_opt('show_price_in_card', 0) ? $product->get_price_html() : '';
 
     ob_start(); ?>
     <div class="wpan-card">
         <a class="wpan-card__img" href="<?php echo esc_url($url); ?>"><?php echo $img; ?></a>
         <div class="wpan-card__body">
-            <span class="wpan-badge"><?php esc_html_e('Анонс', 'wp-announcements'); ?></span>
+            <?php if ($badge): ?><span class="wpan-badge"><?php echo $badge; ?></span><?php endif; ?>
             <h3 class="wpan-card__title"><a href="<?php echo esc_url($url); ?>"><?php echo $title; ?></a></h3>
-            <?php if ($authors): ?><div class="wpan-card__author"><?php echo $authors; ?></div><?php endif; ?>
+            <?php if ($tags): ?><div class="wpan-card__author"><?php echo $tags; ?></div><?php endif; ?>
+            <?php if ($price): ?><div class="wpan-card__price"><?php echo $price; ?></div><?php endif; ?>
             <div class="wpan-card__btn">
                 <a href="#" class="button wpan-btn" data-wpan-open="<?php echo (int) $post_id; ?>"><?php echo $label; ?></a>
             </div>
@@ -664,6 +670,9 @@ function wpan_sanitize($in) {
     $out['subject_admin_rel'] = sanitize_text_field($in['subject_admin_rel'] ?? '');
     $out['rate_limit_hour']   = max(0, (int) ($in['rate_limit_hour'] ?? 20));
     $out['uninstall_wipe']    = !empty($in['uninstall_wipe']) ? 1 : 0;
+    $out['show_tags_in_card'] = !empty($in['show_tags_in_card']) ? 1 : 0;
+    $out['show_price_in_card']= !empty($in['show_price_in_card']) ? 1 : 0;
+    $out['badge_text']        = sanitize_text_field($in['badge_text'] ?? 'Анонс');
     return $out;
 }
 
@@ -703,6 +712,11 @@ function wpan_render_settings() {
                     hover <input type="text" name="<?php echo $opt; ?>[accent_hover]" value="<?php echo esc_attr($o['accent_hover']); ?>" size="8">
                 </td></tr>
                 <tr><th><?php esc_html_e('Лимит подписок с IP/час', 'wp-announcements'); ?></th><td><input type="number" min="0" name="<?php echo $opt; ?>[rate_limit_hour]" value="<?php echo (int) $o['rate_limit_hour']; ?>" class="small-text"> <span class="description"><?php esc_html_e('0 — без лимита', 'wp-announcements'); ?></span></td></tr>
+
+                <tr><th colspan="2"><h2><?php esc_html_e('Карточка в сетке', 'wp-announcements'); ?></h2></th></tr>
+                <tr><th><?php esc_html_e('Текст бейджа', 'wp-announcements'); ?></th><td><input type="text" name="<?php echo $opt; ?>[badge_text]" value="<?php echo esc_attr($o['badge_text']); ?>" class="regular-text"> <span class="description"><?php esc_html_e('например: Анонс, Soon, Preorder. Пусто — скрыть.', 'wp-announcements'); ?></span></td></tr>
+                <tr><th><?php esc_html_e('Показывать метки', 'wp-announcements'); ?></th><td><label><input type="checkbox" name="<?php echo $opt; ?>[show_tags_in_card]" value="1" <?php checked($o['show_tags_in_card']); ?>> <?php esc_html_e('product_tag через запятую (для книг — авторы)', 'wp-announcements'); ?></label></td></tr>
+                <tr><th><?php esc_html_e('Показывать цену', 'wp-announcements'); ?></th><td><label><input type="checkbox" name="<?php echo $opt; ?>[show_price_in_card]" value="1" <?php checked($o['show_price_in_card']); ?>> <?php esc_html_e('вывод стандартной цены WC в карточке', 'wp-announcements'); ?></label></td></tr>
 
                 <tr><th colspan="2"><h2><?php esc_html_e('Письмо клиенту (при выходе из анонсов)', 'wp-announcements'); ?></h2></th></tr>
                 <tr><th><?php esc_html_e('Тема', 'wp-announcements'); ?></th><td><input type="text" name="<?php echo $opt; ?>[subject_user]" value="<?php echo esc_attr($o['subject_user']); ?>" class="large-text"></td></tr>
