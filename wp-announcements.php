@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Announcements
  * Description: Универсальный плагин анонсов для WooCommerce: любые товары (книги, техника, одежда — что угодно) из выбранных категорий становятся непокупаемыми и получают кнопку «Предзаказ» с модалкой. Автоматическая рассылка подписчикам при переводе в обычный каталог. Шорткоды [announcements_grid] и [announcements_page].
- * Version: 1.1.1
+ * Version: 1.2.0
  * Author: Alexander Nemirov
  * License: GPL-2.0-or-later
  * Text Domain: wp-announcements
@@ -11,13 +11,14 @@
 
 if (!defined('ABSPATH')) exit;
 
-define('WPAN_VERSION', '1.1.1');
+define('WPAN_VERSION', '1.2.0');
 define('WPAN_FILE', __FILE__);
 define('WPAN_DIR', plugin_dir_path(__FILE__));
 define('WPAN_URL', plugin_dir_url(__FILE__));
 define('WPAN_OPT', 'wpan_settings');
 define('WPAN_META_IS_ANNOUNCE', '_wpan_is_announcement');
 define('WPAN_META_NOTIFY_PENDING', '_wpan_notify_pending');
+define('WPAN_META_MS_PATH', '_wpan_ms_path');
 define('WPAN_CRON_HOOK', 'wpan_send_notifications');
 define('WPAN_DB_VERSION', '2');
 
@@ -84,7 +85,8 @@ add_action('plugins_loaded', function () {
 
 function wpan_default_settings() {
     return array(
-        'categories'        => array(),
+        'ms_paths'          => array(), // строки, против которых сверяется pathName из МС (подстрока, case-insensitive)
+        'categories'        => array(), // запасной вариант: product_cat в WP (если МС не используется)
         'button_text'       => __('Предзаказ', 'wp-announcements'),
         'modal_title'       => __('Сообщить, когда появится', 'wp-announcements'),
         'modal_desc'        => __('Оставьте email — мы напишем, как только товар появится в продаже.', 'wp-announcements'),
@@ -126,14 +128,41 @@ function wpan_announce_cat_ids() {
     return is_array($ids) ? array_map('intval', $ids) : array();
 }
 
+function wpan_ms_paths() {
+    $v = wpan_opt('ms_paths', array());
+    if (is_string($v)) $v = preg_split('/\r\n|\n|\r/', $v);
+    $v = array_filter(array_map('trim', (array) $v));
+    return array_values($v);
+}
+
+function wpan_ms_path_matches($path_name) {
+    $needles = wpan_ms_paths();
+    if (empty($needles) || $path_name === '' || $path_name === null) return false;
+    $hay = mb_strtolower((string) $path_name);
+    foreach ($needles as $n) {
+        $n_l = mb_strtolower($n);
+        if ($n_l === '') continue;
+        if (mb_strpos($hay, $n_l) !== false) return true;
+    }
+    return false;
+}
+
 function wpan_is_announcement($product) {
-    if (is_numeric($product)) $product = wc_get_product($product);
+    if (is_numeric($product)) { $pid = (int) $product; $product = wc_get_product($product); }
     if (!$product instanceof WC_Product) return false;
+    $pid = $pid ?? $product->get_id();
+
+    // 1) Проверка по МС-пути (основной сценарий при интеграции с wooms)
+    $ms_path = get_post_meta($pid, WPAN_META_MS_PATH, true);
+    if ($ms_path && wpan_ms_path_matches($ms_path)) return true;
+
+    // 2) Запасной вариант: совпадение WP-категории
     $cat_ids = wpan_announce_cat_ids();
-    if (empty($cat_ids)) return false;
-    $product_cats = array_map('intval', $product->get_category_ids());
-    if (empty($product_cats)) return false;
-    return (bool) array_intersect($cat_ids, $product_cats);
+    if (!empty($cat_ids)) {
+        $product_cats = array_map('intval', $product->get_category_ids());
+        if (!empty($product_cats) && array_intersect($cat_ids, $product_cats)) return true;
+    }
+    return false;
 }
 
 // ==========================================
@@ -145,35 +174,47 @@ add_action('set_object_terms', 'wpan_on_terms_changed', 20, 6);
 function wpan_on_terms_changed($object_id, $terms, $tt_ids, $taxonomy, $append, $old_tt_ids) {
     if ($taxonomy !== 'product_cat') return;
     if (get_post_type($object_id) !== 'product') return;
-
-    $announce_cats = wpan_announce_cat_ids();
-    if (empty($announce_cats)) return;
-
-    // Актуальные категории после хука
-    $current_ids = wp_get_object_terms($object_id, 'product_cat', array('fields' => 'ids'));
-    if (is_wp_error($current_ids)) return;
-    $current_ids = array_map('intval', (array) $current_ids);
-
-    $was_announce   = get_post_meta($object_id, WPAN_META_IS_ANNOUNCE, true) === '1';
-    $is_announce_now = (bool) array_intersect($announce_cats, $current_ids);
-
-    update_post_meta($object_id, WPAN_META_IS_ANNOUNCE, $is_announce_now ? '1' : '0');
-
-    // Переход «был анонс → стал обычный» — помечаем для cron-рассылки
-    if ($was_announce && !$is_announce_now) {
-        update_post_meta($object_id, WPAN_META_NOTIFY_PENDING, '1');
-        // И сразу пинаем cron, чтобы обработалось в ближайшие минуты
-        if (!wp_next_scheduled(WPAN_CRON_HOOK)) {
-            wp_schedule_single_event(time() + 30, WPAN_CRON_HOOK);
-        }
-    }
+    wpan_refresh_flag($object_id);
 }
 
 // Актуализация флага при сохранении товара (страховка)
 add_action('woocommerce_update_product', 'wpan_refresh_flag', 30, 1);
 add_action('woocommerce_new_product',    'wpan_refresh_flag', 30, 1);
 function wpan_refresh_flag($product_id) {
-    update_post_meta($product_id, WPAN_META_IS_ANNOUNCE, wpan_is_announcement($product_id) ? '1' : '0');
+    $was = get_post_meta($product_id, WPAN_META_IS_ANNOUNCE, true) === '1';
+    $now = wpan_is_announcement($product_id);
+    update_post_meta($product_id, WPAN_META_IS_ANNOUNCE, $now ? '1' : '0');
+    if ($was && !$now) wpan_queue_notify($product_id);
+}
+
+function wpan_queue_notify($product_id) {
+    update_post_meta($product_id, WPAN_META_NOTIFY_PENDING, '1');
+    if (!wp_next_scheduled(WPAN_CRON_HOOK)) {
+        wp_schedule_single_event(time() + 30, WPAN_CRON_HOOK);
+    }
+}
+
+// ==========================================
+// ИНТЕГРАЦИЯ С WOOMS — сохраняем pathName и пересчитываем флаг
+// ==========================================
+add_filter('wooms_product_update', 'wpan_wooms_capture_path', 100, 2);
+function wpan_wooms_capture_path($product, $row) {
+    if (!$product instanceof WC_Product) return $product;
+    $path = isset($row['pathName']) ? (string) $row['pathName'] : '';
+    if ($path !== '') {
+        $product->update_meta_data(WPAN_META_MS_PATH, $path);
+    }
+    return $product;
+}
+
+// После сохранения товара wooms — wpan_refresh_flag уже отработает через woocommerce_update_product.
+// Но если wooms сохраняет иначе (save_post) — подстрахуемся отдельным хуком.
+add_action('wooms_product_update_after', 'wpan_wooms_after_save', 20, 2);
+function wpan_wooms_after_save($product_id, $row) {
+    if (isset($row['pathName'])) {
+        update_post_meta($product_id, WPAN_META_MS_PATH, (string) $row['pathName']);
+    }
+    wpan_refresh_flag($product_id);
 }
 
 // ==========================================
@@ -655,6 +696,15 @@ function wpan_register_settings() {
 }
 function wpan_sanitize($in) {
     $out = get_option(WPAN_OPT, wpan_default_settings());
+
+    // МС-пути — textarea, по одному на строку
+    $raw = isset($in['ms_paths']) ? (string) $in['ms_paths'] : '';
+    $lines = preg_split('/\r\n|\n|\r/', $raw);
+    $lines = array_values(array_filter(array_map(function ($l) {
+        return sanitize_text_field(trim($l));
+    }, $lines)));
+    $out['ms_paths'] = $lines;
+
     $out['categories']        = isset($in['categories']) ? array_values(array_unique(array_map('intval', (array) $in['categories']))) : array();
     $out['button_text']       = sanitize_text_field($in['button_text']   ?? 'Предзаказ');
     $out['modal_title']       = sanitize_text_field($in['modal_title']   ?? '');
@@ -689,16 +739,40 @@ function wpan_render_settings() {
             <?php settings_fields('wpan_group'); ?>
             <table class="form-table" role="presentation">
                 <tr>
-                    <th scope="row"><?php esc_html_e('Анонсные категории', 'wp-announcements'); ?></th>
+                    <th scope="row"><?php esc_html_e('Пути папок в МойСклад', 'wp-announcements'); ?></th>
                     <td>
-                        <select name="<?php echo $opt; ?>[categories][]" multiple size="10" style="min-width:360px;">
+                        <?php $ms_val = is_array($o['ms_paths'] ?? null) ? implode("\n", $o['ms_paths']) : (string) ($o['ms_paths'] ?? ''); ?>
+                        <textarea name="<?php echo $opt; ?>[ms_paths]" rows="4" class="large-text code" placeholder="Анонсы&#10;Товары и услуги/Предзаказ"><?php echo esc_textarea($ms_val); ?></textarea>
+                        <p class="description"><?php esc_html_e('По одному пути на строку. Сверяется как подстрока (case-insensitive) с полем pathName, которое wooms передаёт из МойСклад. Примеры: «Анонсы», «Товары и услуги/Анонсы». Если товар лежит внутри такой папки — он автоматически становится анонсом, независимо от WP-категории.', 'wp-announcements'); ?></p>
+                        <?php
+                        // Список обнаруженных pathName на товарах — чтобы можно было скопировать.
+                        global $wpdb;
+                        $seen = $wpdb->get_col($wpdb->prepare(
+                            "SELECT DISTINCT meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value <> '' ORDER BY meta_value LIMIT 200",
+                            WPAN_META_MS_PATH
+                        ));
+                        if (!empty($seen)): ?>
+                            <details style="margin-top:8px;"><summary><?php esc_html_e('Обнаруженные МС-пути на товарах (клик — скопировать в буфер)', 'wp-announcements'); ?></summary>
+                                <ul style="max-height:240px;overflow:auto;margin:6px 0;padding:6px;background:#f9f9f9;border:1px solid #ddd;">
+                                <?php foreach ($seen as $p): ?>
+                                    <li style="padding:2px 0;"><code style="cursor:pointer;" onclick="navigator.clipboard&&navigator.clipboard.writeText(this.textContent)"><?php echo esc_html($p); ?></code></li>
+                                <?php endforeach; ?>
+                                </ul>
+                            </details>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><?php esc_html_e('WP-категории (запасной вариант)', 'wp-announcements'); ?></th>
+                    <td>
+                        <select name="<?php echo $opt; ?>[categories][]" multiple size="8" style="min-width:360px;">
                         <?php foreach ((array) $cats as $c): ?>
                             <option value="<?php echo (int) $c->term_id; ?>" <?php selected(in_array((int) $c->term_id, $selected, true)); ?>>
                                 <?php echo esc_html($c->name); ?> (<?php echo (int) $c->count; ?>)
                             </option>
                         <?php endforeach; ?>
                         </select>
-                        <p class="description"><?php esc_html_e('Товары из выбранных категорий становятся анонсами (предзаказ вместо покупки). Ctrl/Cmd — мультивыбор.', 'wp-announcements'); ?></p>
+                        <p class="description"><?php esc_html_e('Для сайтов без МойСклад (или дополнительно к МС-путям). Ctrl/Cmd — мультивыбор.', 'wp-announcements'); ?></p>
                     </td>
                 </tr>
                 <tr><th><?php esc_html_e('Текст кнопки', 'wp-announcements'); ?></th><td><input type="text" name="<?php echo $opt; ?>[button_text]" value="<?php echo esc_attr($o['button_text']); ?>" class="regular-text"></td></tr>
